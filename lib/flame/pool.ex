@@ -40,7 +40,6 @@ defmodule FLAME.Pool do
   alias FLAME.{Pool, Runner, Queue, CodeSync}
   alias FLAME.Pool.{RunnerState, WaitingState, Caller}
 
-  @calling_sample_count 3
   @default_max_concurrency 100
   @boot_timeout 30_000
   @idle_shutdown_after 30_000
@@ -58,7 +57,6 @@ defmodule FLAME.Pool do
             max: nil,
             max_concurrency: nil,
             callers: %{},
-            calling_samples: [],
             waiting: Queue.new(),
             runners: %{},
             pending_runners: %{},
@@ -516,36 +514,16 @@ defmodule FLAME.Pool do
     Queue.size(waiting)
   end
 
-  defp calling_count(state) do
-    map_size(state.callers) + waiting_count(state)
-  end
+  defp available_runner(state) do
+    case Enum.filter(state.runners, fn {_, runner} -> runner.count < state.max_concurrency end) do
+      [] ->
+        nil
 
-  defp sample_calling_count(state) do
-    Map.put(
-      state,
-      :calling_samples,
-      Enum.take([calling_count(state) | state.calling_samples], @calling_sample_count)
-    )
-  end
+      runners ->
+        {_ref, runner} =
+          Enum.max_by(runners, fn {_, %RunnerState{count: count}} -> count end)
 
-  defp needed_runners_count(state) do
-    Enum.sum(state.calling_samples)
-    |> div(state.max_concurrency)
-    |> min(state.max)
-    |> max(1)
-  end
-
-  defp min_runner(state) do
-    if map_size(state.runners) == 0 do
-      nil
-    else
-      {_ref, min} =
-        state.runners
-        |> Enum.sort_by(fn {ref, _} -> ref end)
-        |> Enum.take(needed_runners_count(state))
-        |> Enum.min_by(fn {_, %RunnerState{count: count}} -> count end)
-
-      min
+        runner
     end
   end
 
@@ -615,13 +593,12 @@ defmodule FLAME.Pool do
   end
 
   defp checkout_runner(%Pool{} = state, deadline, from, monitor_ref \\ nil) do
-    state = sample_calling_count(state)
-    min_runner = min_runner(state)
+    available_runner = available_runner(state)
     runner_count = runner_count(state)
 
     cond do
-      min_runner && min_runner.count < state.max_concurrency ->
-        reply_runner_checkout(state, min_runner, from, monitor_ref)
+      available_runner && available_runner.count < state.max_concurrency ->
+        reply_runner_checkout(state, available_runner, from, monitor_ref)
 
       runner_count < state.max ->
         if state.async_boot_timer ||
